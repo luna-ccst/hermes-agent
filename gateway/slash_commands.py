@@ -141,6 +141,33 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _handle_standby_command(
+        self, event: MessageEvent
+    ) -> Union[str, EphemeralReply]:
+        """Stop Slack thread auto-follow until the bot is directly mentioned."""
+        source = event.source
+        if source.platform != Platform.SLACK or not source.thread_id:
+            return EphemeralReply("Standby is available inside a Slack thread.")
+        if source.chat_id.startswith("D"):
+            return EphemeralReply(
+                "Standby isn’t available in one-to-one Slack DMs."
+            )
+
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+            persisted = await self.async_session_store.set_session_metadata(
+                session_entry.session_key,
+                "slack_thread_standby",
+                True,
+            )
+        except Exception:
+            return EphemeralReply("I couldn’t enter standby for this thread.")
+        if not persisted:
+            return EphemeralReply("I couldn’t enter standby for this thread.")
+        return EphemeralReply(
+            "I’ll stand by. @mention me when you’d like me to rejoin."
+        )
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source

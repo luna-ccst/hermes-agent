@@ -25,6 +25,7 @@ import agent.secret_scope as secret_scope
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.platforms.base import (
+    EphemeralReply,
     MessageEvent,
     MessageType,
     SendResult,
@@ -422,6 +423,274 @@ class TestThreadQuietFlag:
         await adapter._process_message_background(event, session_key)
 
         adapter._keep_typing.assert_awaited_once()
+
+
+class TestThreadStandby:
+    class _Runner:
+        def __init__(self, standby=True):
+            self.session_store = MagicMock()
+            self.session_store.config = SimpleNamespace(
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+            )
+            self.session_store.get_session_metadata.return_value = standby
+
+        def _session_key_for_source(self, source):
+            return f"slack:{source.scope_id}:{source.chat_id}:{source.thread_id}"
+
+        async def handle(self, event):
+            return None
+
+    @staticmethod
+    def _thread_event(text="follow up"):
+        return {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "171.200",
+            "thread_ts": "171.100",
+        }
+
+    @pytest.mark.asyncio
+    async def test_standby_drops_unmentioned_thread_message_before_dispatch(
+        self, adapter
+    ):
+        runner = self._Runner(standby=True)
+        adapter.set_session_store(runner.session_store)
+        adapter._message_handler = runner.handle
+        adapter._mentioned_threads.add("171.100")
+
+        await adapter._handle_slack_message(
+            self._thread_event(), {"team_id": "T123"}
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        runner.session_store.get_session_metadata.assert_called_once_with(
+            "agent:main:slack:group:T123:C123:171.100",
+            "slack_thread_standby",
+            False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_standby_lookup_failure_drops_unmentioned_thread_message(
+        self, adapter
+    ):
+        runner = self._Runner(standby=False)
+        runner.session_store.get_session_metadata.side_effect = RuntimeError(
+            "metadata unavailable"
+        )
+        adapter.set_session_store(runner.session_store)
+        adapter._message_handler = runner.handle
+        adapter._mentioned_threads.add("171.100")
+
+        await adapter._handle_slack_message(
+            self._thread_event(), {"team_id": "T123"}
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_standby_uses_adapter_store_with_multiplex_closure_handler(
+        self, adapter
+    ):
+        runner = self._Runner(standby=True)
+        runner.session_store.config = SimpleNamespace(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        adapter.set_session_store(runner.session_store)
+        adapter.set_owner_profile("sales")
+
+        async def multiplex_handler(event):
+            return None
+
+        adapter._message_handler = multiplex_handler
+        adapter._mentioned_threads.add("171.100")
+
+        await adapter._handle_slack_message(
+            self._thread_event(), {"team_id": "T123"}
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        runner.session_store.get_session_metadata.assert_called_once_with(
+            "agent:sales:slack:group:T123:C123:171.100",
+            "slack_thread_standby",
+            False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_mention_clears_standby_and_dispatches(self, adapter):
+        runner = self._Runner(standby=True)
+        adapter.set_session_store(runner.session_store)
+        adapter._message_handler = runner.handle
+        adapter._fetch_thread_context = AsyncMock(return_value="")
+
+        await adapter._handle_slack_message(
+            self._thread_event("<@U_BOT> please rejoin"), {"team_id": "T123"}
+        )
+
+        runner.session_store.set_session_metadata.assert_any_call(
+            "agent:main:slack:group:T123:C123:171.100",
+            "slack_thread_standby",
+            False,
+        )
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text == "please rejoin"
+
+    @pytest.mark.asyncio
+    async def test_direct_mention_clear_failure_is_logged_and_not_dispatched(
+        self, adapter, caplog
+    ):
+        import logging
+
+        runner = self._Runner(standby=True)
+        runner.session_store.set_session_metadata.side_effect = RuntimeError(
+            "metadata unavailable"
+        )
+        adapter.set_session_store(runner.session_store)
+        adapter._message_handler = runner.handle
+        adapter._fetch_thread_context = AsyncMock(return_value="")
+        caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.adapter")
+
+        await adapter._handle_slack_message(
+            self._thread_event("<@U_BOT> please rejoin"), {"team_id": "T123"}
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert "Slack standby-state clear failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_standby_command_persists_state_without_running_agent(self):
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        source = SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="group",
+            user_id="U_USER",
+            thread_id="171.100",
+            scope_id="T123",
+        )
+        event = MessageEvent(
+            text="/standby",
+            message_type=MessageType.COMMAND,
+            source=source,
+        )
+        session_entry = SimpleNamespace(session_key="slack:T123:C123:171.100")
+        runner = object.__new__(GatewaySlashCommandsMixin)
+        runner.async_session_store = SimpleNamespace(
+            get_or_create_session=AsyncMock(return_value=session_entry),
+            set_session_metadata=AsyncMock(return_value=True),
+        )
+
+        result = await runner._handle_standby_command(event)
+
+        assert isinstance(result, EphemeralReply)
+        assert result.text == (
+            "I’ll stand by. @mention me when you’d like me to rejoin."
+        )
+        runner.async_session_store.set_session_metadata.assert_awaited_once_with(
+            "slack:T123:C123:171.100",
+            "slack_thread_standby",
+            True,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failing_operation",
+        ["get_or_create_session", "set_session_metadata"],
+    )
+    async def test_standby_command_returns_ephemeral_failure_on_store_exception(
+        self, failing_operation
+    ):
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        source = SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="group",
+            user_id="U_USER",
+            thread_id="171.100",
+            scope_id="T123",
+        )
+        event = MessageEvent(
+            text="/standby",
+            message_type=MessageType.COMMAND,
+            source=source,
+        )
+        session_entry = SimpleNamespace(session_key="slack:T123:C123:171.100")
+        runner = object.__new__(GatewaySlashCommandsMixin)
+        runner.async_session_store = SimpleNamespace(
+            get_or_create_session=AsyncMock(return_value=session_entry),
+            set_session_metadata=AsyncMock(return_value=True),
+        )
+        getattr(runner.async_session_store, failing_operation).side_effect = RuntimeError(
+            "session store unavailable"
+        )
+
+        result = await runner._handle_standby_command(event)
+
+        assert isinstance(result, EphemeralReply)
+        assert result.text == "I couldn’t enter standby for this thread."
+
+    @pytest.mark.asyncio
+    async def test_standby_command_is_thread_only(self):
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        source = SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="group",
+            user_id="U_USER",
+            thread_id=None,
+            scope_id="T123",
+        )
+        event = MessageEvent(
+            text="/standby",
+            message_type=MessageType.COMMAND,
+            source=source,
+        )
+        runner = object.__new__(GatewaySlashCommandsMixin)
+        runner.async_session_store = SimpleNamespace(
+            get_or_create_session=AsyncMock(),
+            set_session_metadata=AsyncMock(),
+        )
+
+        result = await runner._handle_standby_command(event)
+
+        assert isinstance(result, EphemeralReply)
+        assert "inside a Slack thread" in result.text
+        runner.async_session_store.get_or_create_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_standby_command_rejects_one_to_one_dm_thread(self):
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        source = SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U_USER",
+            thread_id="171.100",
+            scope_id="T123",
+        )
+        event = MessageEvent(
+            text="/standby",
+            message_type=MessageType.COMMAND,
+            source=source,
+        )
+        runner = object.__new__(GatewaySlashCommandsMixin)
+        runner.async_session_store = SimpleNamespace(
+            get_or_create_session=AsyncMock(),
+            set_session_metadata=AsyncMock(),
+        )
+
+        result = await runner._handle_standby_command(event)
+
+        assert isinstance(result, EphemeralReply)
+        assert result.text == "Standby isn’t available in one-to-one Slack DMs."
+        runner.async_session_store.get_or_create_session.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +1800,26 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
         assert msg_event.get_command() == "stop"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("typed", ["!standby", "!s"])
+    async def test_standby_bang_commands_resolve_to_canonical_command(
+        self, adapter, typed
+    ):
+        await adapter._handle_slack_message(self._make_event(typed))
+
+        msg_event = adapter.handle_message.call_args.args[0]
+        assert msg_event.text == "/standby"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.get_command() == "standby"
+
+    def test_standby_shortcut_does_not_publish_native_slash(self):
+        from hermes_cli.commands import resolve_command, slack_native_slashes
+
+        assert resolve_command("standby").name == "standby"
+        assert resolve_command("s") is None
+        native_names = {name for name, _description, _hint in slack_native_slashes()}
+        assert "standby" not in native_names
+        assert "s" not in native_names
 
     @pytest.mark.asyncio
     async def test_mentioned_bang_command_ignores_rich_text_context(self, adapter):
@@ -3076,6 +3365,8 @@ class TestThreadReplyHandling:
         store = MagicMock()
         store._entries = {}
         store._ensure_loaded = MagicMock()
+        store.get_session_metadata.return_value = False
+        store.set_session_metadata.return_value = True
         store.config = MagicMock()
         store.config.group_sessions_per_user = True
         return store

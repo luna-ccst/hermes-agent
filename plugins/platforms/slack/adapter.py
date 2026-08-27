@@ -452,6 +452,9 @@ def _rewrite_known_bang_command(text: str) -> str:
 
         first_token = text[1:].split(maxsplit=1)[0]
         cmd_name = first_token.split("@", 1)[0].lower()
+        if cmd_name == "s":
+            remainder = text[1 + len(first_token):]
+            return "/standby" + remainder
         if cmd_name and "/" not in cmd_name and is_gateway_known_command(cmd_name):
             return "/" + text[1:]
     except Exception:  # pragma: no cover - defensive
@@ -6467,6 +6470,28 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
+            if is_thread_reply:
+                standby_key, thread_standby = await self._thread_standby_state(
+                    channel_id,
+                    str(event_thread_ts),
+                    user_id,
+                    team_id=team_id,
+                    chat_type="dm" if is_dm else "group",
+                )
+                if thread_standby:
+                    if is_mentioned and standby_key:
+                        cleared = await self._clear_thread_standby(standby_key)
+                        if not cleared:
+                            return
+                    else:
+                        logger.debug(
+                            "[Slack] Ignoring unmentioned reply while thread is "
+                            "in standby: channel=%s thread_ts=%s",
+                            channel_id,
+                            event_thread_ts,
+                        )
+                        return
+
             # A message that opens by @mentioning another user is directed at
             # that person. Stay silent unless we are also mentioned — this
             # overrides free-response and mentioned-thread auto-follow so the
@@ -8888,6 +8913,67 @@ class SlackAdapter(BasePlatformAdapter):
 
             return True
         except Exception:
+            return False
+
+    async def _thread_standby_state(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+        team_id: str = "",
+        *,
+        chat_type: str = "group",
+    ) -> tuple[str | None, bool]:
+        """Return the canonical session key and durable standby state."""
+        session_store = getattr(self, "_session_store", None)
+        get_metadata = getattr(session_store, "get_session_metadata", None)
+        if not callable(get_metadata) or not thread_ts:
+            return None, False
+
+        session_key: str | None = None
+        try:
+            session_key = self._build_thread_session_key(
+                channel_id,
+                thread_ts,
+                user_id,
+                team_id=team_id,
+                chat_type=chat_type,
+            )
+            if not session_key:
+                raise RuntimeError("canonical Slack thread session key unavailable")
+            active = bool(
+                await asyncio.to_thread(
+                    get_metadata,
+                    session_key,
+                    "slack_thread_standby",
+                    False,
+                )
+            )
+            return session_key, active
+        except Exception:
+            logger.debug("Slack standby-state lookup failed", exc_info=True)
+            return session_key, True
+
+    async def _clear_thread_standby(self, session_key: str) -> bool:
+        """Clear durable standby when a user directly mentions the bot."""
+        session_store = getattr(self, "_session_store", None)
+        set_metadata = getattr(session_store, "set_session_metadata", None)
+        if not callable(set_metadata) or not session_key:
+            logger.error("Slack standby-state clear failed: metadata store unavailable")
+            return False
+        try:
+            cleared = await asyncio.to_thread(
+                set_metadata,
+                session_key,
+                "slack_thread_standby",
+                False,
+            )
+            if not cleared:
+                logger.error("Slack standby-state clear failed")
+                return False
+            return True
+        except Exception:
+            logger.error("Slack standby-state clear failed", exc_info=True)
             return False
 
     # Hostname suffixes Slack serves file content from. ``url_private`` /

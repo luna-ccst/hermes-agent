@@ -382,6 +382,12 @@ Understanding how Hermes behaves in different contexts:
 In channels, always @mention the bot to start a conversation. Once the bot is active in a thread, you can reply in that thread without mentioning it. Outside of threads, messages without @mention are ignored to prevent noise in busy channels.
 :::
 
+### Put one thread on standby
+
+In an active Slack thread, type `!standby` (or the short form `!s`) to stop Hermes from following unmentioned replies in that thread. Hermes acknowledges once, keeps the existing conversation session, and drops later unmentioned messages before they reach the agent. The standby state survives gateway restarts.
+
+Directly `@mention` Hermes in the thread to clear standby and rejoin the conversation. Both forms are intentionally typed Slack commands; they do not consume workspace-wide `/standby` or `/s` slash-command slots.
+
 ---
 
 ## Configuration Options
