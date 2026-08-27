@@ -6154,17 +6154,17 @@ class SlackAdapter(BasePlatformAdapter):
 
         original_text = event.get("text", "")
 
-        # A trailing ~ opts this Slack thread into durable quiet mode. Strip the
-        # transport flag before any block/thread
-        # enrichment so it never reaches the model or persisted transcript.
+        # A trailing ~ enables durable verbose mode; ~~ restores quiet mode.
+        # Strip the transport flag before any block/thread enrichment so it
+        # never reaches the model or persisted transcript.
         from gateway.thread_quiet_mode import (
             QUIET_MODE_ACTIVE_EVENT_KEY,
             QUIET_MODE_EVENT_KEY,
             QUIET_MODE_SESSION_KEY,
-            strip_trailing_quiet_flag,
+            strip_trailing_mode_flag,
         )
 
-        original_text, quiet_thread_requested = strip_trailing_quiet_flag(
+        original_text, quiet_thread_requested = strip_trailing_mode_flag(
             original_text
         )
 
@@ -7066,11 +7066,12 @@ class SlackAdapter(BasePlatformAdapter):
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
         )
 
-        # Rehydrate durable quiet mode before BasePlatformAdapter starts its
-        # typing/status loop. The first ~ turn is active immediately; later
-        # replies consult the thread's persisted session metadata.
-        quiet_thread_active = quiet_thread_requested
-        if not quiet_thread_active and _runner is not None:
+        # Rehydrate the durable display mode before the gateway starts work.
+        # Threads default to quiet; ~ opts into verbose and ~~ restores quiet.
+        quiet_thread_active = (
+            True if quiet_thread_requested is None else quiet_thread_requested
+        )
+        if quiet_thread_requested is None and _runner is not None:
             _session_store = getattr(_runner, "session_store", None)
             _session_key_fn = getattr(_runner, "_session_key_for_source", None)
             _get_session_metadata = getattr(
@@ -7084,7 +7085,7 @@ class SlackAdapter(BasePlatformAdapter):
                             _get_session_metadata,
                             _quiet_session_key,
                             QUIET_MODE_SESSION_KEY,
-                            False,
+                            True,
                         )
                     )
                 except Exception:
@@ -7152,8 +7153,8 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
                 **(
-                    {QUIET_MODE_EVENT_KEY: True}
-                    if quiet_thread_requested
+                    {QUIET_MODE_EVENT_KEY: quiet_thread_requested}
+                    if quiet_thread_requested is not None
                     else {}
                 ),
                 **(

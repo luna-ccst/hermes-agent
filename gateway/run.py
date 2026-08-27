@@ -5458,7 +5458,11 @@ class TurnRunner:
             ctx.user_config, platform_key, "streaming"
         )
         # None = no per-platform override → follow global config
-        _streaming_enabled = not ctx.quiet_mode_enabled and (
+        from gateway.thread_quiet_mode import resolve_thread_display_policy
+        _thread_display_policy = resolve_thread_display_policy(
+            ctx.quiet_mode_enabled
+        )
+        _streaming_enabled = _thread_display_policy.streaming and (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
@@ -28415,7 +28419,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = not quiet_thread_mode and (
+        from gateway.thread_quiet_mode import resolve_thread_display_policy
+        _thread_display_policy = resolve_thread_display_policy(quiet_thread_mode)
+        _streaming_enabled = _thread_display_policy.streaming and (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
@@ -28927,9 +28933,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
+        from gateway.thread_quiet_mode import resolve_thread_display_policy
+        _thread_display_policy = resolve_thread_display_policy(quiet_thread_mode)
+        _slack_thread_mode = source.platform == Platform.SLACK
+        _effective_progress_mode = (
+            _thread_display_policy.tool_progress_mode_override
+            if _slack_thread_mode
+            and _thread_display_policy.tool_progress_mode_override is not None
+            else progress_mode
+        )
         tool_progress_enabled = (
-            not quiet_thread_mode
-            and progress_mode not in {"off", "log"}
+            _thread_display_policy.tool_progress
+            and _effective_progress_mode not in {"off", "log"}
             and source.platform != Platform.WEBHOOK
         )
         # Live working-state status for text-rendering typing indicators
@@ -28945,13 +28960,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _live_status_adapter = self._adapter_for_source(source)
         if not getattr(_live_status_adapter, "supports_status_text", False):
             _live_status_adapter = None
-        if _live_status_mode == "off" or quiet_thread_mode:
+        if _live_status_mode == "off" or not _thread_display_policy.live_status:
             _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = (
-            not quiet_thread_mode
-            and progress_mode == "log"
+            _thread_display_policy.tool_log
+            and _effective_progress_mode == "log"
             and source.platform != Platform.WEBHOOK
         )
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
@@ -28964,7 +28979,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            not quiet_thread_mode
+            _thread_display_policy.interim_assistant_messages
             and source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
@@ -28977,7 +28992,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        _thinking_enabled = not quiet_thread_mode and _thinking_mode != "off"
+        if (
+            _slack_thread_mode
+            and _thread_display_policy.thinking_progress_mode_override is not None
+        ):
+            _thinking_mode = _thread_display_policy.thinking_progress_mode_override
+        _thinking_enabled = (
+            _thread_display_policy.thinking_progress
+            and _thinking_mode != "off"
+        )
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack
@@ -28986,7 +29009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _progress_adapter_for_native = self._adapter_for_source(source)
         _native_slack_task_cards = False
         if (
-            not quiet_thread_mode
+            _thread_display_policy.native_task_cards
             and source.platform == Platform.SLACK
             and _progress_adapter_for_native is not None
             and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
@@ -29069,7 +29092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
             _thinking_enabled=_thinking_enabled,
-            progress_mode=progress_mode,
+            progress_mode=_effective_progress_mode,
             progress_grouping=progress_grouping,
             tool_progress_enabled=tool_progress_enabled,
             progress_queue=progress_queue,
@@ -29531,7 +29554,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
             allow_generic=True,
         )
-        if _long_running_mode == "off" or quiet_thread_mode:
+        if (
+            _long_running_mode == "off"
+            or not _thread_display_policy.long_running_notifications
+        ):
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 

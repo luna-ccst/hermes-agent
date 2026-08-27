@@ -309,11 +309,15 @@ class TestSlackWorkspaceCollisionIsolation:
 
 class TestThreadQuietFlag:
     @pytest.mark.asyncio
-    async def test_trailing_flag_is_stripped_and_forwarded_as_event_metadata(
-        self, adapter
+    @pytest.mark.parametrize(
+        ("marker", "quiet_requested", "quiet_active"),
+        [("~", False, False), ("~~", True, True)],
+    )
+    async def test_trailing_mode_flag_is_stripped_and_forwarded_as_event_metadata(
+        self, adapter, marker, quiet_requested, quiet_active
     ):
         event = {
-            "text": "Investigate the failed deploy ~",
+            "text": f"Investigate the failed deploy {marker}",
             "user": "U123",
             "channel": "D123",
             "channel_type": "im",
@@ -325,17 +329,21 @@ class TestThreadQuietFlag:
         adapter.handle_message.assert_awaited_once()
         forwarded = adapter.handle_message.await_args.args[0]
         assert forwarded.text == "Investigate the failed deploy"
-        assert forwarded.metadata["slack_thread_quiet_requested"] is True
-        assert forwarded.metadata["slack_thread_quiet_active"] is True
+        assert forwarded.metadata["slack_thread_quiet_requested"] is quiet_requested
+        assert (
+            forwarded.metadata.get("slack_thread_quiet_active", False)
+            is quiet_active
+        )
 
     @pytest.mark.asyncio
-    async def test_persisted_thread_mode_marks_followup_quiet_without_repeated_flag(
-        self, adapter
+    @pytest.mark.parametrize("saved_quiet_mode", [True, False])
+    async def test_persisted_thread_mode_applies_without_repeated_flag(
+        self, adapter, saved_quiet_mode
     ):
         class Runner:
             def __init__(self):
                 self.session_store = MagicMock()
-                self.session_store.get_session_metadata.return_value = True
+                self.session_store.get_session_metadata.return_value = saved_quiet_mode
 
             def _session_key_for_source(self, source):
                 return f"slack:{source.scope_id}:{source.chat_id}:{source.thread_id}"
@@ -359,8 +367,27 @@ class TestThreadQuietFlag:
         forwarded = adapter.handle_message.await_args.args[0]
         assert forwarded.text == "Any update?"
         assert "slack_thread_quiet_requested" not in forwarded.metadata
-        assert forwarded.metadata["slack_thread_quiet_active"] is True
+        assert (
+            forwarded.metadata.get("slack_thread_quiet_active", False)
+            is saved_quiet_mode
+        )
         runner.session_store.get_session_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_thread_defaults_to_quiet_without_a_saved_preference(self, adapter):
+        event = {
+            "text": "Any update?",
+            "user": "U123",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "171.200",
+            "thread_ts": "171.100",
+        }
+
+        await adapter._handle_slack_message(event, {"team_id": "T123"})
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.metadata["slack_thread_quiet_active"] is True
 
     @pytest.mark.asyncio
     async def test_active_quiet_event_keeps_slack_typing_status(self, adapter):
