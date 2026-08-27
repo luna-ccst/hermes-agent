@@ -303,6 +303,101 @@ class TestSlackWorkspaceCollisionIsolation:
 
 
 # ---------------------------------------------------------------------------
+# TestThreadQuietFlag
+# ---------------------------------------------------------------------------
+
+
+class TestThreadQuietFlag:
+    @pytest.mark.asyncio
+    async def test_trailing_flag_is_stripped_and_forwarded_as_event_metadata(
+        self, adapter
+    ):
+        event = {
+            "text": "Investigate the failed deploy ~",
+            "user": "U123",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "171.100",
+        }
+
+        await adapter._handle_slack_message(event, {"team_id": "T123"})
+
+        adapter.handle_message.assert_awaited_once()
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.text == "Investigate the failed deploy"
+        assert forwarded.metadata["slack_thread_quiet_requested"] is True
+        assert forwarded.metadata["slack_thread_quiet_active"] is True
+
+    @pytest.mark.asyncio
+    async def test_persisted_thread_mode_marks_followup_quiet_without_repeated_flag(
+        self, adapter
+    ):
+        class Runner:
+            def __init__(self):
+                self.session_store = MagicMock()
+                self.session_store.get_session_metadata.return_value = True
+
+            def _session_key_for_source(self, source):
+                return f"slack:{source.scope_id}:{source.chat_id}:{source.thread_id}"
+
+            async def handle(self, event):
+                return None
+
+        runner = Runner()
+        adapter._message_handler = runner.handle
+        event = {
+            "text": "Any update?",
+            "user": "U123",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "171.200",
+            "thread_ts": "171.100",
+        }
+
+        await adapter._handle_slack_message(event, {"team_id": "T123"})
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.text == "Any update?"
+        assert "slack_thread_quiet_requested" not in forwarded.metadata
+        assert forwarded.metadata["slack_thread_quiet_active"] is True
+        runner.session_store.get_session_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_active_quiet_event_keeps_slack_typing_status(self, adapter):
+        async def keep_typing_until_cancelled(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        async def finish_after_typing_task_gets_a_turn(event):
+            await asyncio.sleep(0.01)
+            return None
+
+        adapter.config.typing_indicator = True
+        adapter._message_handler = AsyncMock(
+            side_effect=finish_after_typing_task_gets_a_turn
+        )
+        adapter._keep_typing = AsyncMock(side_effect=keep_typing_until_cancelled)
+        source = adapter.build_source(
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U123",
+            thread_id="171.100",
+            scope_id="T123",
+        )
+        event = MessageEvent(
+            text="Any update?",
+            message_type=MessageType.TEXT,
+            source=source,
+            metadata={"slack_thread_quiet_active": True},
+        )
+        session_key = "slack:T123:D123:171.100"
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._process_message_background(event, session_key)
+
+        adapter._keep_typing.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # TestAppMentionHandler
 # ---------------------------------------------------------------------------
 

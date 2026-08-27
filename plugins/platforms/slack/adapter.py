@@ -6154,6 +6154,20 @@ class SlackAdapter(BasePlatformAdapter):
 
         original_text = event.get("text", "")
 
+        # A trailing ~ opts this Slack thread into durable quiet mode. Strip the
+        # transport flag before any block/thread
+        # enrichment so it never reaches the model or persisted transcript.
+        from gateway.thread_quiet_mode import (
+            QUIET_MODE_ACTIVE_EVENT_KEY,
+            QUIET_MODE_EVENT_KEY,
+            QUIET_MODE_SESSION_KEY,
+            strip_trailing_quiet_flag,
+        )
+
+        original_text, quiet_thread_requested = strip_trailing_quiet_flag(
+            original_text
+        )
+
         # Slack blocks native slash commands inside threads ("/queue is not
         # supported in threads. Sorry!").  As a workaround, recognise a
         # leading ``!`` as an alternate command prefix and rewrite it to
@@ -7052,6 +7066,33 @@ class SlackAdapter(BasePlatformAdapter):
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
         )
 
+        # Rehydrate durable quiet mode before BasePlatformAdapter starts its
+        # typing/status loop. The first ~ turn is active immediately; later
+        # replies consult the thread's persisted session metadata.
+        quiet_thread_active = quiet_thread_requested
+        if not quiet_thread_active and _runner is not None:
+            _session_store = getattr(_runner, "session_store", None)
+            _session_key_fn = getattr(_runner, "_session_key_for_source", None)
+            _get_session_metadata = getattr(
+                _session_store, "get_session_metadata", None
+            )
+            if callable(_session_key_fn) and callable(_get_session_metadata):
+                try:
+                    _quiet_session_key = _session_key_fn(source)
+                    quiet_thread_active = bool(
+                        await asyncio.to_thread(
+                            _get_session_metadata,
+                            _quiet_session_key,
+                            QUIET_MODE_SESSION_KEY,
+                            False,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "Slack quiet-mode rehydration failed",
+                        exc_info=True,
+                    )
+
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
             resolve_channel_prompt,
@@ -7110,6 +7151,16 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                **(
+                    {QUIET_MODE_EVENT_KEY: True}
+                    if quiet_thread_requested
+                    else {}
+                ),
+                **(
+                    {QUIET_MODE_ACTIVE_EVENT_KEY: True}
+                    if quiet_thread_active
+                    else {}
+                ),
             },
         )
 
