@@ -2182,6 +2182,8 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        *,
+        busy_policy: str = "reject",
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -2200,7 +2202,13 @@ class PluginContext:
         as free-form chat.
 
         Names conflicting with built-in commands are rejected with a warning.
+
+        ``busy_policy`` defaults to ``"reject"`` while a gateway turn is
+        running. Use ``"dispatch"`` only for handlers safe to run alongside
+        the active agent. Plugin commands cannot request interruption.
         """
+        if busy_policy not in ("reject", "dispatch"):
+            raise ValueError("busy_policy must be 'reject' or 'dispatch'")
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning(
@@ -2211,8 +2219,8 @@ class PluginContext:
 
         # Reject if it conflicts with a built-in command
         try:
-            from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
+            from hermes_cli.commands import _COMMAND_LOOKUP
+            if clean in _COMMAND_LOOKUP:
                 logger.warning(
                     "Plugin '%s' tried to register command '/%s' which conflicts "
                     "with a built-in command. Skipping.",
@@ -2229,6 +2237,7 @@ class PluginContext:
             "plugin": self.manifest.name,
             "plugin_key": self.manifest.key or self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "busy_policy": busy_policy,
         }
         self._manager._plugin_commands[clean] = entry
         handle = self._track_replacement(

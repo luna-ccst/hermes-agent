@@ -420,7 +420,24 @@ def resolve_command(name: str) -> CommandDef | None:
 
     Accepts names with or without the leading slash.
     """
-    return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
+    clean = name.lower().lstrip("/")
+    builtin = _COMMAND_LOOKUP.get(clean)
+    if builtin is not None:
+        return builtin
+    clean = clean.replace("_", "-")
+    try:
+        from hermes_cli.plugins import get_plugin_commands
+        entry = get_plugin_commands().get(clean)
+    except Exception:
+        # Optional plugin discovery must not break built-in/unknown commands.
+        return None
+    if entry is not None:
+        return CommandDef(
+            clean, entry["description"], "Plugins",
+            args_hint=entry.get("args_hint", ""),
+            busy_policy=entry.get("busy_policy", "reject"),
+        )
+    return None
 
 
 def _build_description(cmd: CommandDef) -> str:

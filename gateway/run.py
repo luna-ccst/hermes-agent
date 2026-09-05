@@ -16922,6 +16922,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }.get(name)
             if plain is not None:
                 return await plain(event)
+            if policy == "dispatch":
+                try:
+                    from hermes_cli.plugins import get_plugin_command_handler
+                    plugin_handler = get_plugin_command_handler(name)
+                    if plugin_handler is not None:
+                        result = plugin_handler(event.get_command_args().strip())
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
+                except Exception as e:
+                    logger.warning("Plugin command dispatch failed: %s", e)
+                    return f"Plugin command '/{name}' failed."
             logger.warning(
                 "busy_policy=%s for /%s has no mid-run handler — "
                 "falling back to busy-reject", policy, name,
