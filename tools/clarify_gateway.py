@@ -180,8 +180,11 @@ def get_pending_for_session(
     session_key: str,
     *,
     include_choice_prompts: bool = False,
+    request_id: Optional[str] = None,
 ) -> Optional[_ClarifyEntry]:
-    """Return the oldest pending clarify entry for a session, or None.
+    """Return a live clarify entry for a session, or None.
+
+    An explicit request_id selects only that ID, never a FIFO replacement.
 
     By default this only returns entries awaiting free-form text (open-ended
     clarifies, or a multi-choice clarify after the user picked ``Other``).
@@ -193,8 +196,10 @@ def get_pending_for_session(
     with _lock:
         ids = _session_index.get(session_key) or []
         for cid in ids:
+            if request_id is not None and cid != request_id:
+                continue
             entry = _entries.get(cid)
-            if entry is None:
+            if entry is None or entry.event.is_set():
                 continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
@@ -425,8 +430,14 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return _json.dumps(selected, ensure_ascii=False)
 
 
-def attempt_text_response_for_session(session_key: str, response: str) -> str:
+def attempt_text_response_for_session(
+    session_key: str, response: str, *, request_id: Optional[str] = None,
+) -> str:
     """Try to resolve the oldest pending clarify in ``session_key`` from typed text.
+
+    If request_id is supplied, require that exact clarify ID. A stale or empty
+    binding never falls back to the session's current prompt. Resolution still
+    uses the ID-addressed, locked resolver, so replacement after the check is safe.
 
     Returns one of:
       - ``TEXT_RESOLVED`` — accepted; waiter unblocked
@@ -436,7 +447,9 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
         pending clarify armed so the user can retry
       - ``TEXT_NO_PENDING`` — no interceptable clarify for this session
     """
-    entry = get_pending_for_session(session_key, include_choice_prompts=True)
+    entry = get_pending_for_session(
+        session_key, include_choice_prompts=True, request_id=request_id,
+    )
     if entry is None:
         return TEXT_NO_PENDING
 

@@ -6256,6 +6256,10 @@ class TurnRunner:
             # the redacted value.
             cmd = _redact_approval_command(cmd)
 
+            _approval_metadata = dict(ctx._status_thread_metadata or {})
+            _approval_metadata["is_approval_prompt"] = True
+            _approval_metadata["approval_request_id"] = approval_data.get("request_id")
+
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
@@ -6267,7 +6271,7 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6318,10 +6322,6 @@ class TurnRunner:
                 smart_denied=approval_data.get("smart_denied", False),
             )
             try:
-                # Mark as approval prompt so WeCom routes through control lane
-                _approval_metadata = dict(ctx._status_thread_metadata or {})
-                _approval_metadata["is_approval_prompt"] = True
-
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(
                         ctx._status_chat_id,
@@ -17434,6 +17434,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         allow_gateway_control = event.allow_gateway_control
+        if event.trusted_prompt_reply is not None:
+            return await self._handle_bound_prompt_reply(event, _quick_key)
         _up_state = self._peek_session_state(_quick_key)
         if (
             allow_gateway_control

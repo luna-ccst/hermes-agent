@@ -2433,6 +2433,12 @@ class MessageEvent:
     # clarify resolvers) BEFORE normal dispatch; native adapters never set it
     # (their button callbacks resolve in-process).
     prompt_response: Optional[Dict[str, Any]] = None
+
+    # Trusted adapter-only correlation, never copied from message text/raw data.
+    # None preserves legacy routing. A present binding must fail closed and
+    # never fall through to another prompt or general command dispatch.
+    # Shape: {kind: "approval" | "clarify", request_id: str, session_key: str}.
+    trusted_prompt_reply: Optional[Dict[str, str]] = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.

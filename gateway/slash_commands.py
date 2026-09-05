@@ -5856,6 +5856,38 @@ class GatewaySlashCommandsMixin:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+    async def _handle_bound_prompt_reply(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Consume adapter-bound input after the normal gateway authorization gate.
+
+        A stale/malformed reply is terminal for this delivery, never an answer
+        to another prompt, a slash confirmation, or an ordinary agent turn.
+        """
+        binding = event.trusted_prompt_reply
+        if (
+            not event.allow_gateway_control
+            or not isinstance(binding, dict)
+            or binding.get("session_key") != session_key
+            or not isinstance(binding.get("request_id"), str)
+            or not binding["request_id"]
+        ):
+            return ""
+        text = event.text.strip()
+        if binding.get("kind") == "approval":
+            if text in {"/approve", "/approve session", "/approve always"}:
+                return await self._handle_approve_command(event)
+            if text == "/deny":
+                return await self._handle_deny_command(event)
+        elif binding.get("kind") == "clarify" and text and not text.startswith("/"):
+            from tools import clarify_gateway
+            outcome = clarify_gateway.attempt_text_response_for_session(
+                session_key, text, request_id=binding["request_id"],
+            )
+            if outcome == clarify_gateway.TEXT_RESOLVED:
+                adapter = self._adapter_for_source(event.source)
+                if adapter:
+                    adapter.resume_typing_for_chat(event.source.chat_id)
+        return ""
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -5901,7 +5933,17 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        binding = event.trusted_prompt_reply
+        if binding is not None and (
+            binding.get("kind") != "approval"
+            or binding.get("session_key") != session_key
+            or not binding.get("request_id")
+        ):
+            return t("gateway.approve.no_pending")
+        count = resolve_gateway_approval(
+            session_key, choice, resolve_all=resolve_all,
+            request_id=binding["request_id"] if binding is not None else None,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -5980,9 +6022,17 @@ class GatewaySlashCommandsMixin:
         if reason:
             reason = reason[:280].strip()
 
+        binding = event.trusted_prompt_reply
+        if binding is not None and (
+            binding.get("kind") != "approval"
+            or binding.get("session_key") != session_key
+            or not binding.get("request_id")
+        ):
+            return t("gateway.approve.no_pending")
         count = resolve_gateway_approval(
             session_key, "deny", resolve_all=resolve_all,
             reason=reason or None,
+            request_id=binding["request_id"] if binding is not None else None,
         )
         if not count:
             return t("gateway.deny.no_pending")

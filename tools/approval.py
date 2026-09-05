@@ -2835,7 +2835,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     When *resolve_all* is True every pending approval in the session is
     resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    is resolved (FIFO). An explicit *request_id* resolves only that request,
+    regardless of *resolve_all*. Missing/empty/stale IDs never fall back to FIFO;
+    only None selects the legacy unbound behavior. Selection and resolution are
+    performed under the same lock as queue removal and interrupt cancellation.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2847,8 +2850,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+        if request_id is not None:
+            if not isinstance(request_id, str) or not request_id:
+                return 0
+            targets = [entry for entry in queue
+                       if entry.data.get("request_id") == request_id
+                       and not entry.event.is_set()]
             if not targets:
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
@@ -2860,11 +2867,11 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             _gateway_queues.pop(session_key, None)
 
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
+        for entry in targets:
+            entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.event.set()
     return len(targets)
 
 
@@ -4591,8 +4598,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                     "returning deny for session %s",
                     session_key,
                 )
-                entry.result = "deny"
-                entry.event.set()
+                with _lock:
+                    entry.result = "deny"
+                    entry.event.set()
                 resolved = True
                 break
             _remaining = _deadline - time.monotonic()
