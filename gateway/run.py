@@ -5526,11 +5526,17 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
+            # This callback carries complete assistant narrative, unlike raw
+            # tool status or token deltas. Adapters may render it prominently
+            # without treating it as the authoritative turn-final delivery.
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata={
+                        **_interim_metadata(ctx._status_thread_metadata),
+                        "assistant_message_kind": "milestone",
+                    },
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -23067,7 +23073,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await adapter.send(
                         source.chat_id,
                         text_content,
-                        metadata=metadata,
+                        # A complete model answer before a queued continuation
+                        # is narrative, but not the enclosing turn's final send.
+                        metadata={
+                            **_interim_metadata(metadata),
+                            "assistant_message_kind": "milestone",
+                        },
                     )
 
         # Failed turns still deliver their (normalized failure) text above,

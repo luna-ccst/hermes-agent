@@ -235,7 +235,8 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
     adapter.send.assert_awaited_once_with(
         "chat-1",
         "Quote here",
-        metadata={"thread_id": "topic-1"},
+        metadata={"thread_id": "topic-1", "_interim_send": True,
+                  "assistant_message_kind": "milestone"},
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
@@ -285,7 +286,8 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     adapter.send.assert_awaited_once_with(
         "chat-1",
         "Threaded image",
-        metadata=routing_metadata,
+        metadata={**routing_metadata, "_interim_send": True,
+                  "assistant_message_kind": "milestone"},
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
@@ -326,7 +328,8 @@ async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
-        metadata={"thread_id": "topic-1"},
+        metadata={"thread_id": "topic-1", "_interim_send": True,
+                  "assistant_message_kind": "milestone"},
     )
     adapter.send_multiple_images.assert_not_awaited()
 
@@ -369,7 +372,8 @@ async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
-        metadata={"thread_id": "topic-1"},
+        metadata={"thread_id": "topic-1", "_interim_send": True,
+                  "assistant_message_kind": "milestone"},
     )
     adapter.send_multiple_images.assert_not_awaited()
     adapter.send_document.assert_not_awaited()
@@ -408,7 +412,8 @@ async def test_queued_followup_delivery_preserves_protected_media_example():
     adapter.send.assert_awaited_once_with(
         "chat-1",
         response,
-        metadata={"thread_id": "topic-1"},
+        metadata={"thread_id": "topic-1", "_interim_send": True,
+                  "assistant_message_kind": "milestone"},
     )
     adapter.send_multiple_images.assert_not_awaited()
     adapter.send_document.assert_not_awaited()

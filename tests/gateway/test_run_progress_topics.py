@@ -1925,3 +1925,37 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_narrative_callback_marks_nonstreaming_milestones(monkeypatch, tmp_path):
+    class ImmutableCaptureAdapter(ProgressCaptureAdapter):
+        SUPPORTS_MESSAGE_EDITING = False
+
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, CommentaryAgent,
+        session_id="narrative-metadata", adapter_cls=ImmutableCaptureAdapter,
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+    assert result["final_response"] == "done"
+    narrative = [call for call in adapter.sent if call["content"] == "I'll inspect the repo first."]
+    assert len(narrative) == 1
+    metadata = narrative[0]["metadata"]
+    assert metadata["assistant_message_kind"] == "milestone"
+    assert metadata["_interim_send"] is True
+    assert not metadata.get("notify", False)
+    assert metadata["thread_id"] == "17585"
+    assert all("assistant_message_kind" not in (call.get("metadata") or {}) for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_queued_answer_metadata_is_narrative_not_final():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+    metadata = {"thread_id": "thread"}
+    await runner._deliver_queued_first_response("Completed this step", source=source,
+        adapter=adapter, metadata=metadata, deliver_media=False)
+    assert adapter.sent[-1]["metadata"] == {
+        "thread_id": "thread", "_interim_send": True, "assistant_message_kind": "milestone"}
+    assert metadata == {"thread_id": "thread"}
