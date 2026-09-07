@@ -475,6 +475,25 @@ def aux_progress_hook(hook):
         _aux_progress.hook = prev
 
 
+def _raise_if_protected_aux_cancelled() -> None:
+    if _aux_interrupt_protected() and _aux_interrupt_cancel_requested():
+        raise AuxiliaryExplicitCancellation()
+
+
+def _sleep_before_aux_retry(seconds: float) -> None:
+    """Keep protected retry waits inside the owner's cancellation budget."""
+    if not _aux_interrupt_protected() or not callable(_capture_aux_cancel_check()):
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        _raise_if_protected_aux_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.02, remaining))
+
+
 def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],
@@ -9374,8 +9393,17 @@ def call_llm(
     """Run an auxiliary LLM request, applying the configured task limit."""
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
-        semaphore.acquire()
+        if _aux_interrupt_protected() and callable(_capture_aux_cancel_check()):
+            while True:
+                _raise_if_protected_aux_cancelled()
+                if semaphore.acquire(timeout=0.02):
+                    break
+        else:
+            semaphore.acquire()
     try:
+        # Also check after acquisition: cancellation may win with the permit.
+        # The finally releases it only if this request actually acquired it.
+        _raise_if_protected_aux_cancelled()
         response = _call_llm_impl(
             task=task,
             provider=provider,
@@ -9701,7 +9729,7 @@ def _call_llm_impl(
                     task or "call", _attempt, _max_transient_retries, _backoff,
                     _last_transient,
                 )
-                time.sleep(_backoff)
+                _sleep_before_aux_retry(_backoff)
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(

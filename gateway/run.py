@@ -20253,6 +20253,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_wait_started = time.monotonic()
+                                    _hyg_commit_fence.set_deadline(
+                                        _hyg_wait_started + _hyg_total_ceiling_seconds
+                                    )
                                     _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
@@ -20273,17 +20277,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # A hard ceiling bounds the total wait so
                                         # a degenerate trickle stream can't hold
                                         # the turn forever.
-                                        _hyg_wait_started = time.monotonic()
                                         while True:
                                             # #76354 S3: charge the idle budget
                                             # from the LAST PROGRESS event, not
                                             # from the start of this wait slice —
                                             # otherwise silence can approach 2x
                                             # the configured timeout.
-                                            _slice = max(
-                                                _hyg_timeout_seconds
-                                                - _hyg_commit_fence.seconds_since_progress(),
-                                                0.005,
+                                            _remaining = _hyg_commit_fence.remaining_seconds()
+                                            if _remaining <= 0:
+                                                raise asyncio.TimeoutError()
+                                            _slice = min(
+                                                max(
+                                                    _hyg_timeout_seconds
+                                                    - _hyg_commit_fence.seconds_since_progress(),
+                                                    0.005,
+                                                ),
+                                                _remaining,
                                             )
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
@@ -20310,6 +20319,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     continue
                                                 raise
                                     except asyncio.TimeoutError:
+                                        from agent.conversation_compression import format_compression_timeout
+                                        _timeout_detail = format_compression_timeout(
+                                            _hyg_timeout_seconds,
+                                            time.monotonic() - _hyg_wait_started,
+                                            _hyg_commit_fence.seconds_since_progress(),
+                                            _hyg_total_ceiling_seconds,
+                                        )
                                         _cancelled = None
                                         while _cancelled is None:
                                             # #76354 F1: a hung commit retains the
@@ -20361,8 +20377,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     self, session_entry.session_id,
                                                     _hyg_cooldown,
                                                     "session hygiene compression "
-                                                    "timed out with no output from "
-                                                    "the summary model",
+                                                    f"timed out {_timeout_detail}",
                                                 )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
@@ -20376,18 +20391,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
-                                                "made no progress for %.1fs "
-                                                "(total wait %.1fs, ceiling %.1fs); "
+                                                "timed out %s; "
                                                 "continuing without compression",
                                                 session_entry.session_id,
-                                                _hyg_commit_fence.seconds_since_progress(),
-                                                time.monotonic() - _hyg_wait_started,
-                                                _hyg_total_ceiling_seconds,
+                                                _timeout_detail,
                                             )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
+                                                f"{_timeout_detail}. "
                                                 "No messages were dropped — continuing without "
                                                 "compression. Run /compress to retry, /reset for "
                                                 "a clean session, or check your "

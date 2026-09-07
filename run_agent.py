@@ -8024,6 +8024,7 @@ class AIAgent:
         from agent.conversation_compression import (
             CompressionCommitFence,
             compress_context,
+            format_compression_timeout,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
         )
@@ -8135,13 +8136,12 @@ class AIAgent:
                     return system_message or ""
 
             def _on_timeout(idle, waited, since_progress):
+                detail = format_compression_timeout(
+                    idle, waited, since_progress, total_ceiling,
+                )
                 logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
+                    "Context compression timed out %s; continuing without compression",
+                    detail,
                 )
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
@@ -8163,8 +8163,7 @@ class AIAgent:
                     if callable(record):
                         try:
                             record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
+                                f"host compress_context timeout {detail}"
                             )
                         except Exception:
                             logger.debug(
@@ -8176,8 +8175,7 @@ class AIAgent:
                 if callable(emit):
                     emit(
                         "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
+                        f"{detail}. No messages were dropped — continuing without "
                         "compression. Run /compress to retry, /new for a clean "
                         "session, or check auxiliary.compression."
                     )

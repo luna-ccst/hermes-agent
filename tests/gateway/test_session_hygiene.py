@@ -990,6 +990,125 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
 
 
 # ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming,reason", [(True, "total ceiling"), (False, "idle timeout")])
+async def test_hygiene_timeout_reports_observed_reason(monkeypatch, tmp_path, caplog, streaming, reason):
+    release = threading.Event()
+    finished = threading.Event()
+    fences = []
+    wait_slices = []
+    real_wait_for = asyncio.wait_for
+
+    async def observed_wait_for(awaitable, timeout):
+        if fences and not fences[0].is_cancelled:
+            wait_slices.append((timeout, fences[0].remaining_seconds()))
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", observed_wait_for)
+
+    class SlowAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self.context_compressor = MagicMock()
+
+        def _compress_context(self, messages, *args, commit_fence=None, **kwargs):
+            fences.append(commit_fence)
+            try:
+                while not release.wait(0.002):
+                    if streaming:
+                        commit_fence.touch_progress()
+                assert not commit_fence.begin_commit()
+                return messages, ""
+            finally:
+                finished.set()
+
+        def close(self):
+            pass
+
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, SlowAgent,
+        "compression:\n  threshold: 0.5\n  hygiene_timeout_seconds: 0.1\n"
+        "  hygiene_total_ceiling_seconds: 0.25\n",
+    )
+    import gateway.run as gateway_run
+    record = MagicMock()
+    monkeypatch.setattr(gateway_run, "_record_hygiene_cooldown", record)
+    try:
+        await runner._handle_message(event)
+        warnings = [s["content"] for s in adapter.sent if "Context compression timed out" in s["content"]]
+        assert len(warnings) == 1
+        assert reason in warnings[0]
+        assert "no output" not in warnings[0]
+        assert "No messages were dropped" in warnings[0]
+        assert reason in caplog.text
+        assert reason in record.call_args.args[-1]
+        if streaming:
+            assert wait_slices
+        assert all(duration <= remaining + 0.005 for duration, remaining in wait_slices)
+        runner.session_store.rewrite_transcript.assert_not_called()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_hygiene_budget_reaches_lean_digests(monkeypatch, tmp_path, timeout):
+    import run_agent as real_run_agent
+    from run_agent import AIAgent
+
+    seen = []
+    agents = []
+    release = threading.Event()
+    digest_done = threading.Event()
+
+    class DigestAgent(AIAgent):
+        def __init__(self, **kwargs):
+            kwargs.update(provider="openrouter", model="test/model", base_url="https://openrouter.ai/api/v1")
+            super().__init__(**kwargs, skip_context_files=True)
+            self._compression_feasibility_checked = True
+            self._cached_system_prompt = "sys"
+            agents.append(self)
+            compressor = self.context_compressor
+
+            def compress(messages, **kw):
+                try:
+                    compressor._augment_summary_lean("summary", messages)
+                    return messages
+                finally:
+                    digest_done.set()
+
+            monkeypatch.setattr(compressor, "compress", compress)
+
+    def provider(**kwargs):
+        seen.append(kwargs["timeout"])
+        if timeout:
+            assert release.wait(10)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="digest"))])
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", provider)
+    monkeypatch.setattr("agent.context_compressor._serialize_turns_for_digest", lambda *args: "x" * 150000)
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, DigestAgent,
+        f"compression:\n  threshold: 0.5\n  hygiene_timeout_seconds: {0.5 if timeout else 10}\n"
+        "  hygiene_total_ceiling_seconds: 20\n",
+    )
+    monkeypatch.setitem(sys.modules, "run_agent", real_run_agent)
+    monkeypatch.setattr(real_run_agent, "AIAgent", DigestAgent)
+    try:
+        await runner._handle_message(event)
+        assert len(seen) == (1 if timeout else 3)
+        assert all(value is not None and 0 < value < 20 for value in seen)
+        if timeout:
+            warnings = [s["content"] for s in adapter.sent if "Context compression timed out" in s["content"]]
+            assert len(warnings) == 1 and "idle timeout" in warnings[0]
+        runner.session_store.rewrite_transcript.assert_not_called()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(digest_done.wait, 3)
+    assert len(seen) == (1 if timeout else 3)
+
+
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 

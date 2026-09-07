@@ -4521,9 +4521,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         Splits the region into ``_LEAN_DIGEST_CHUNK_CHARS`` chunks (capped at
         ``_LEAN_DIGEST_MAX_CHUNKS`` — beyond that, earliest chunks are merged
         coarser) and digests each with the compression LLM. Any chunk failure
-        degrades to a placeholder naming the message range; the whole call
-        never raises. Chunks run sequentially on the same transport as the
-        main summary.
+        degrades to a recovery placeholder. Host cancellation stops scheduling;
+        optional digests share the remaining host budget, reserving time for
+        deterministic user/recovery sections and commit. Chunks stay sequential
+        on the main summary's transport. Explicit hard stops still propagate.
         """
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
@@ -4535,22 +4536,70 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
+        cancelled = getattr(self, "_compression_cancelled_check", None)
+        remaining = getattr(self, "_compression_remaining_seconds", None)
+        initial_remaining = remaining() if callable(remaining) else None
+        reserve = min(5.0, max(0.0, initial_remaining) * 0.1) if initial_remaining is not None else 0.0
+        from types import SimpleNamespace
+        from agent.auxiliary_client import (
+            _capture_aux_cancel_check, _effective_aux_timeout,
+            aux_interrupt_protection, call_llm,
+        )
+
+        # Reuse the attempt-isolated provider cancellation seam. A read timeout
+        # alone is not a total budget (streams/retries can extend it). Override
+        # the nested Event, which has precedence over cancel_check, but preserve
+        # and latch the parent's hard-stop cause so it can never be swallowed as
+        # optional digest degradation, even if that Event is later cleared.
+        parent_cancel = _capture_aux_cancel_check()
+        stop_reason = None
+
+        def stop_digest():
+            nonlocal stop_reason
+            if stop_reason is not None:
+                return True
+            if callable(parent_cancel) and parent_cancel():
+                stop_reason = "hard"
+            elif callable(cancelled) and cancelled():
+                stop_reason = "cancelled"
+            elif callable(remaining):
+                value = remaining()
+                if value is not None and value <= reserve:
+                    stop_reason = "budget exhausted"
+            return stop_reason is not None
+
+        cancel_event = SimpleNamespace(is_set=stop_digest)
         digests: list[str] = []
         for ci in range(n_chunks):
+            if callable(cancelled) and cancelled():
+                digests.append(
+                    f"[digests cancelled for segments {ci + 1}-{n_chunks}/{n_chunks} "
+                    "— recover via session_search]"
+                )
+                break
+            budget = remaining() if callable(remaining) else None
+            available = max(0.0, budget - reserve) if budget is not None else None
+            if available is not None and available < 1.0:
+                digests.append(
+                    f"[digest budget exhausted for segments {ci + 1}-{n_chunks}/{n_chunks} "
+                    "— recover via session_search]"
+                )
+                break
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
             try:
-                from agent.auxiliary_client import call_llm
-
-                resp = call_llm(
-                    messages=[{
-                        "role": "user",
-                        "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
-                    }],
-                    task="compression",
-                    max_tokens=_LEAN_DIGEST_MAX_TOKENS,
-                )
+                with aux_interrupt_protection(cancel_event=cancel_event):
+                    resp = call_llm(
+                        messages=[{
+                            "role": "user",
+                            "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
+                        }],
+                        task="compression",
+                        max_tokens=_LEAN_DIGEST_MAX_TOKENS,
+                        timeout=(min(available, _effective_aux_timeout("compression", None))
+                                 if available is not None else None),
+                    )
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -4558,6 +4607,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 from agent.agent_runtime_helpers import strip_think_blocks
 
                 body = strip_think_blocks(None, body).strip()
+            except AuxiliaryExplicitCancellation:
+                if stop_reason not in ("cancelled", "budget exhausted"):
+                    raise
+                # Never schedule a sibling after detaching an in-flight request.
+                # The isolated provider may finish later, but owns no summary or
+                # session state. Keep the main summary and deterministic context.
+                digests.append(
+                    f"[digests {stop_reason} for segments {ci + 1}-{n_chunks}/{n_chunks} "
+                    "— recover via session_search]"
+                )
+                break
             except Exception as exc:
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
                 body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
@@ -5081,12 +5141,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
+            cancelled = getattr(self, "_compression_cancelled_check", None)
+            if callable(cancelled) and cancelled():
+                # A late digest must not overwrite the host's timeout cooldown
+                # or install a previous summary from an uncommitted attempt.
+                return None
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
-            self._last_summary_error = None
+            # Cooldown clearing owns _last_summary_error. Do not reset it here:
+            # the host may have recorded a timeout during provenance validation
+            # (or immediately after the cancellation-aware clear returned).
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
             self._last_summary_empty_content_failure = False
@@ -7675,6 +7742,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._previous_summary = _previous_summary_before_scan
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
                 raise
+
+        cancelled = getattr(self, "_compression_cancelled_check", None)
+        if callable(cancelled) and cancelled():
+            # Host timeout is neither summary failure nor permission to build a
+            # static fallback. Leave the transcript and iterative summary intact.
+            self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
+            return messages
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
