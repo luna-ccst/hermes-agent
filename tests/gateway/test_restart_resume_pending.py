@@ -33,7 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import MessageDisposition, MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -748,7 +748,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         message_type=MessageType.TEXT,
         source=source,
     )
-    assert await runner._handle_message(inbound) is None
+    assert await runner._handle_message(inbound) is MessageDisposition.DEFERRED
     assert scheduled == 1
     assert seen == ["resume-start"]
     assert runner._startup_restore_queue == [inbound]
@@ -1057,7 +1057,7 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
         message_type=MessageType.TEXT,
         source=make_restart_source(chat_id="restore-chat"),
     )
-    assert await runner._handle_message(inbound) is None
+    assert await runner._handle_message(inbound) is MessageDisposition.DEFERRED
     assert runner._startup_restore_queue == [inbound]
 
     # The gate must release on the bound even though the resume turn is
@@ -1117,7 +1117,7 @@ async def test_startup_restore_gate_releases_when_boot_path_send_hangs(
         message_type=MessageType.TEXT,
         source=make_restart_source(chat_id="restore-chat"),
     )
-    assert await runner._handle_message(inbound) is None
+    assert await runner._handle_message(inbound) is MessageDisposition.DEFERRED
     assert runner._startup_restore_queue == [inbound]
 
     await asyncio.wait_for(

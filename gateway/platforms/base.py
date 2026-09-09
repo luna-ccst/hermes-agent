@@ -2368,6 +2368,13 @@ class MessageType(Enum):
     COMMAND = "command"  # /command style
 
 
+class MessageDisposition(Enum):
+    """Non-response handoffs, distinct from a completed silent/streamed turn."""
+
+    DEFERRED = "deferred"  # another owner will process this exact event later
+    REJECTED = "rejected"  # terminal refusal; never retry as successful work
+
+
 class ProcessingOutcome(Enum):
     """Result classification for message-processing lifecycle hooks."""
 
@@ -2473,6 +2480,12 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Trusted adapter opt-in for durable deliveries with per-event receipts.
+    # Normal turns wait for the current Base owner (including cleanup), rather
+    # than entering lossy merge/steer or the runner's in-band recursive drain.
+    # The adapter owns ordering/backpressure; control replies bypass this wait.
+    requires_processing_completion: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2869,7 +2882,9 @@ _RETRYABLE_ERROR_PATTERNS = (
 # Type for message handlers.  Handlers may return a plain string (normal
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
 # ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+# A MessageDisposition explicitly transfers ownership or rejects the event;
+# neither is a completed silent response.
+MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply", MessageDisposition]]]]
 
 
 def resolve_channel_prompt(
@@ -3167,7 +3182,8 @@ class BasePlatformAdapter(ABC):
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
-        self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._durable_waiters: Dict[str, set[asyncio.Event]] = {}
+        self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[Union[bool, MessageDisposition]]]] = None
         # Owning profile for a multiplexed secondary adapter, installed by
         # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
         # keys must carry the profile namespace, but ``source.profile`` is only
@@ -3819,7 +3835,7 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
-    def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
+    def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[Union[bool, MessageDisposition]]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
 
@@ -5582,6 +5598,10 @@ class BasePlatformAdapter(ABC):
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
+        if hook_name == "on_processing_complete" and args:
+            # Mark before awaiting: replay cancellation must not issue a second
+            # receipt when Base already owns this completion attempt.
+            args[0]._hermes_processing_completion_reported = True
         hook = getattr(self, hook_name, None)
         if not callable(hook):
             return
@@ -5620,6 +5640,8 @@ class BasePlatformAdapter(ABC):
         doesn't override :meth:`delete_message` so non-supporting
         platforms silently degrade to normal sends.
         """
+        if isinstance(response, MessageDisposition):
+            return None, 0
         if isinstance(response, EphemeralReply):
             ttl = response.ttl_seconds
             if ttl is None:
@@ -6045,6 +6067,9 @@ class BasePlatformAdapter(ABC):
         asyncio where the event loop's cancellation-propagation semantics
         differ subtly from a bare ``asyncio.run`` harness.
         """
+        if discard_pending:
+            for waiter in self._durable_waiters.get(session_key, ()):
+                waiter.set()
         task = self._session_tasks.pop(session_key, None)
         if task is not None and not task.done():
             logger.debug(
@@ -6100,7 +6125,7 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
-    ) -> None:
+    ) -> Optional[Union[MessageDisposition, ProcessingOutcome]]:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
         /stop, /new, and /reset must:
@@ -6124,9 +6149,19 @@ class BasePlatformAdapter(ABC):
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        outcome = ProcessingOutcome.SUCCESS
 
         try:
             response = await self._message_handler(event)
+            if isinstance(response, MessageDisposition):
+                # Rejected/deferred commands did not stop anything. Restore the
+                # prior owner rather than cancelling it after an auth refusal.
+                if self._active_sessions.get(session_key) is command_guard:
+                    if current_guard is not None:
+                        self._active_sessions[session_key] = current_guard
+                    else:
+                        self._release_session_guard(session_key, guard=command_guard)
+                return response
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
@@ -6147,12 +6182,18 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
+                if not _r.success:
+                    outcome = ProcessingOutcome.FAILURE
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
                         message_id=_r.message_id,
                         ttl_seconds=_eph_ttl,
                     )
+            # Cancel durable ownership waits BEFORE releasing/cancelling the
+            # owner; otherwise a waiting turn can start after an accepted stop.
+            for waiter in self._durable_waiters.get(session_key, ()):
+                waiter.set()
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -6171,6 +6212,7 @@ class BasePlatformAdapter(ABC):
             raise
 
         await self._drain_pending_after_session_command(session_key, command_guard)
+        return outcome
 
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -6181,6 +6223,8 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
+            if event.requires_processing_completion:
+                await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             return
 
         if event.allow_gateway_control:
@@ -6248,13 +6292,25 @@ class BasePlatformAdapter(ABC):
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
                     self._discard_text_debounce(session_key)
+                    outcome = ProcessingOutcome.FAILURE
                     try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
+                        disposition = await self._dispatch_active_session_command(event, session_key, cmd)
+                        if disposition is MessageDisposition.DEFERRED:
+                            outcome = None
+                        elif disposition is MessageDisposition.REJECTED:
+                            outcome = ProcessingOutcome.CANCELLED
+                        elif isinstance(disposition, ProcessingOutcome):
+                            outcome = disposition
+                        else:
+                            outcome = ProcessingOutcome.SUCCESS
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
+                    finally:
+                        if event.requires_processing_completion and outcome is not None:
+                            await self._run_processing_hook("on_processing_complete", event, outcome)
                     return
 
                 # Other bypass commands (/approve, /deny, /status,
@@ -6264,10 +6320,12 @@ class BasePlatformAdapter(ABC):
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,
                 )
+                outcome = ProcessingOutcome.FAILURE
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
+                    delivery_succeeded = True
                     if _text:
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
@@ -6275,14 +6333,21 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
+                        delivery_succeeded = _r.success
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    outcome = (None if response is MessageDisposition.DEFERRED else
+                               ProcessingOutcome.CANCELLED if response is MessageDisposition.REJECTED else
+                               ProcessingOutcome.SUCCESS if delivery_succeeded else ProcessingOutcome.FAILURE)
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                finally:
+                    if event.requires_processing_completion and outcome is not None:
+                        await self._run_processing_hook("on_processing_complete", event, outcome)
                 return
 
             # Clarify reply bypass: if the agent is blocked on a
@@ -6315,12 +6380,14 @@ class BasePlatformAdapter(ABC):
                         "[%s] Routing message to clarify text-intercept for %s",
                         self.name, session_key,
                     )
+                    outcome = ProcessingOutcome.FAILURE
                     try:
                         _thread_meta = _thread_metadata_for_source(
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        delivery_succeeded = True
                         if _text:
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
@@ -6328,22 +6395,74 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
+                            delivery_succeeded = _r.success
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        outcome = (None if response is MessageDisposition.DEFERRED else
+                                   ProcessingOutcome.CANCELLED if response is MessageDisposition.REJECTED else
+                                   ProcessingOutcome.SUCCESS if delivery_succeeded else ProcessingOutcome.FAILURE)
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
+                    finally:
+                        if event.requires_processing_completion and outcome is not None:
+                            await self._run_processing_hook("on_processing_complete", event, outcome)
                     return
+
+            if event.requires_processing_completion:
+                # A durable delivery needs its OWN background wrapper/receipt.
+                # The runner's busy queue can consume events recursively inside
+                # another wrapper, which only completes the original event.
+                # Wait for ownership to end, not for an early completion hook;
+                # shield ensures cancelling this delivery cannot cancel that run.
+                cancelled = asyncio.Event()
+                waiters = self._durable_waiters.setdefault(session_key, set())
+                waiters.add(cancelled)
+                try:
+                    while True:
+                        if cancelled.is_set():
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.CANCELLED)
+                            return
+                        self._heal_stale_session_lock(session_key)
+                        if session_key not in self._active_sessions:
+                            break
+                        owner = self._session_tasks.get(session_key)
+                        if owner is None or owner is asyncio.current_task():
+                            await self._run_processing_hook(
+                                "on_processing_complete", event, ProcessingOutcome.FAILURE,
+                            )
+                            return
+                        try:
+                            await asyncio.shield(owner)
+                        except asyncio.CancelledError:
+                            current = asyncio.current_task()
+                            if current is not None and current.cancelling():
+                                raise
+                            # The previous owner was cancelled, not this delivery.
+                        except Exception:
+                            logger.debug("[%s] Previous session owner failed", self.name, exc_info=True)
+                    self._start_session_processing(event, session_key)
+                    return
+                finally:
+                    waiters.discard(cancelled)
+                    if not waiters and self._durable_waiters.get(session_key) is waiters:
+                        self._durable_waiters.pop(session_key, None)
 
             if self._busy_session_handler is not None:
                 try:
-                    if await self._busy_session_handler(event, session_key):
+                    disposition = await self._busy_session_handler(event, session_key)
+                    if disposition is MessageDisposition.REJECTED:
+                        await self._run_processing_hook(
+                            "on_processing_complete", event, ProcessingOutcome.CANCELLED,
+                        )
+                        return
+                    if disposition:
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
@@ -6421,6 +6540,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        completion_reported = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6469,6 +6589,16 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            if response is MessageDisposition.DEFERRED:
+                # Handoff is not completion. The startup replay (or another
+                # explicit owner) will issue the receipt for this same event.
+                return
+            if response is MessageDisposition.REJECTED:
+                completion_reported = True
+                await self._run_processing_hook(
+                    "on_processing_complete", event, ProcessingOutcome.CANCELLED,
+                )
+                return
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6976,6 +7106,7 @@ class BasePlatformAdapter(ABC):
                 )
                 or ""
             )
+            completion_reported = True
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
@@ -7031,10 +7162,12 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            if not completion_reported:
+                await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            if not completion_reported:
+                await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

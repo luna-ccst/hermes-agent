@@ -2678,6 +2678,7 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MessageDisposition,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
@@ -10354,7 +10355,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool | MessageDisposition:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -10369,7 +10370,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
-            return True  # handled (silently dropped); do not fall through
+            return MessageDisposition.REJECTED  # terminal; do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
 
@@ -12018,6 +12019,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _dispatch_startup_restore_event(self, adapter, event: MessageEvent) -> None:
+        """Own a durable replay's wait without blocking other startup sessions."""
+        from gateway.platforms.base import ProcessingOutcome
+
+        event._hermes_processing_completion_reported = False
+        try:
+            await adapter.handle_message(event)
+        except asyncio.CancelledError:
+            if not event._hermes_processing_completion_reported:
+                await adapter._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            raise
+        except Exception:
+            logger.exception("Startup replay dispatch failed")
+            if not event._hermes_processing_completion_reported:
+                await adapter._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
         drained = 0
@@ -12040,7 +12057,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
-            await adapter.handle_message(event)
+            if event.requires_processing_completion:
+                # This dispatch can wait for a live owner. Keep it tracked by
+                # the adapter so shutdown cancels it, but do not hold the global
+                # startup gate or unrelated sessions behind that owner's run.
+                task = asyncio.create_task(self._dispatch_startup_restore_event(adapter, event))
+                adapter._background_tasks.add(task)
+                task.add_done_callback(adapter._background_tasks.discard)
+            else:
+                await adapter.handle_message(event)
             drained += 1
         return drained
 
@@ -17148,7 +17173,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
-    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_message(self, event: MessageEvent) -> Optional[str | MessageDisposition]:
         """
         Handle an incoming message from any platform.
         
@@ -17235,7 +17260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
             self._queue_startup_restore_event(event)
-            return None
+            return MessageDisposition.DEFERRED
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -17300,9 +17325,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
-                return None
+                return MessageDisposition.REJECTED if event.requires_processing_completion else None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            if event.requires_processing_completion:
+                return MessageDisposition.REJECTED
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
