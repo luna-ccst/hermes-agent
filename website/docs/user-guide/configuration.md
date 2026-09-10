@@ -956,6 +956,55 @@ Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
 The summary model **must** have a context window at least as large as your main agent model's. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is smaller than the main model's, the summarization call will fail with a context length error. When this happens, the middle turns are **dropped without a summary**, losing conversation context silently. If you override the model, verify its context length meets or exceeds your main model's.
 :::
 
+## Gateway New-Session Models
+
+Use `gateway.new_session_models` to choose an initial model by the conversation's
+origin platform, without switching models in existing conversations:
+
+```yaml
+gateway:
+  new_session_models:
+    default: gpt-5.6-sol
+    linear: gpt-6-astra
+```
+
+```bash
+hermes config set gateway.new_session_models.default gpt-5.6-sol
+hermes config set gateway.new_session_models.linear gpt-6-astra
+```
+
+Keys are exact platform IDs, including installed plugin platforms such as
+`linear`. The origin, not a notification's delivery destination, selects the
+model. A platform entry takes precedence over `default`. Values must be nonempty
+model-ID strings supported by the configured provider; this setting does not
+switch providers or store credentials. The default mapping is empty (legacy
+behavior). Invalid entries are ignored.
+
+The choice is persisted through the existing session model override when a new
+conversation is created, including `/new`, `/reset`, and automatic resets. If a
+channel override applies, its model/provider choice is seeded instead (lookup
+order: chat, thread, parent channel; first matching entry wins). Provider-only
+channel overrides retain their existing runtime resolution and are not seeded,
+because the provider may supply its own bundled model. A subsequent
+explicit `/model` replaces the seeded choice. Reusing, resuming, or restarting
+an existing session does not reseed it. Changing these defaults does not force a
+model switch each turn; reset the conversation to take a new default. The mapping
+is loaded with the gateway's startup configuration, not hot-reloaded per turn.
+
+This is **gateway-only**: it does not change CLI, cron, or other non-gateway model
+defaults. In multiplex mode it belongs to the gateway's configuration, like its
+session reset policies. For a one-off CLI choice use `hermes chat --model MODEL`.
+
+:::warning Safe rollout
+Installing new code does not load it into an already-running gateway. These new
+keys can be staged while an older gateway runs (it ignores them), but activation
+requires a separately authorized normal gateway restart. Do not restart merely
+to stage configuration. Leave `model.default` unchanged if existing unpinned
+sessions must retain their legacy model: that global setting is read at runtime
+and changing it can affect existing sessions. New-session defaults do not
+migrate or pin legacy sessions retroactively.
+:::
+
 ## Gateway Turn Lease Timeout
 
 The gateway serializes turns by their resolved session ID so two routing keys

@@ -2923,6 +2923,7 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                model_override=self._new_session_model_override(source),
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -3416,6 +3417,36 @@ class SessionStore:
                 self._save()
         return count
 
+    def _new_session_model_override(
+        self, source: Optional[SessionSource], *, platform: Optional[Platform] = None
+    ) -> Optional[Dict[str, str]]:
+        """Pin an opted-in default once; existing sessions are never reseeded."""
+        defaults = self.config.new_session_models
+        model = defaults.get("default")
+        platform = source.platform if source else platform
+        if platform:
+            model = defaults.get(platform.value, model)
+        if not model:
+            return None  # No opt-in: preserve legacy channel/global resolution.
+        override = {"model": model}
+        platform_config = self.config.platforms.get(source.platform) if source else None
+        if source and platform_config:
+            # Same first-match order as gateway.run._get_channel_override.
+            # Seed the effective channel choice, not a default that shadows it.
+            for key in (source.chat_id, source.thread_id, source.parent_chat_id):
+                channel = platform_config.channel_overrides.get(str(key)) if key else None
+                if channel is not None:
+                    if channel.provider and not channel.model:
+                        # Provider-only routes can supply a bundled model at
+                        # runtime. Do not pin an incompatible default over it.
+                        return None
+                    if channel.model:
+                        override["model"] = channel.model
+                    if channel.provider:
+                        override["provider"] = channel.provider
+                    break
+        return sanitize_model_override(override)
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
@@ -3444,6 +3475,9 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                model_override=self._new_session_model_override(
+                    old_entry.origin, platform=old_entry.platform
+                ),
             )
 
             self._entries[session_key] = new_entry

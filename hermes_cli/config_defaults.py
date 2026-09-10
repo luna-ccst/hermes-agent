@@ -3050,6 +3050,10 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Opt-in creation/reset-only model IDs: platform name or "default".
+        # Existing conversations and the CLI/global model are not changed.
+        "new_session_models": {},
+
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,

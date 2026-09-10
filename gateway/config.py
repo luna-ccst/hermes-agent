@@ -931,6 +931,10 @@ class GatewayConfig:
     """
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
+
+    # Opt-in model IDs pinned only when a conversation is created/reset.
+    # Keys are platform names (including plugins), plus "default".
+    new_session_models: Dict[str, str] = field(default_factory=dict, kw_only=True)
     
     # Session reset policies by type
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
@@ -1137,6 +1141,7 @@ class GatewayConfig:
             },
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
+            "new_session_models": self.new_session_models,
             "sessions_dir": str(self.sessions_dir),
             "write_sessions_json": self.write_sessions_json,
             "always_log_local": self.always_log_local,
@@ -1316,6 +1321,12 @@ class GatewayConfig:
             reset_by_platform=reset_by_platform,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
+            new_session_models={
+                key: value for key, value in _coerce_dict(
+                    data.get("new_session_models", nested_gateway.get("new_session_models"))
+                ).items()
+                if isinstance(key, str) and isinstance(value, str) and value.strip()
+            },
             sessions_dir=sessions_dir,
             write_sessions_json=_coerce_bool(data.get("write_sessions_json"), True),
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
@@ -1420,6 +1431,8 @@ def load_gateway_config() -> GatewayConfig:
             # already established for gateway.multiplex_profiles/streaming/
             # write_sessions_json: top-level wins, nested gateway.* falls back.
             gateway_section = yaml_cfg.get("gateway")
+            if isinstance(gateway_section, dict) and "new_session_models" in gateway_section:
+                gw_data["new_session_models"] = gateway_section["new_session_models"]
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
