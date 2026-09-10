@@ -7162,6 +7162,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # with the synthetic resume turns for the same session.  The queued
         # events drain only after all startup resume tasks have finished.
         self._startup_restore_in_progress = False
+        self._startup_restore_release_event = asyncio.Event()
+        self._startup_restore_release_event.set()
         # Set by start_gateway() only for an explicit ``--replace`` launch.
         # _connect_initial_adapter_with_timeout scopes it to each adapter's
         # cold-start connect and removes it before any reconnect can run.
@@ -12019,6 +12021,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _set_startup_restore_in_progress(self, in_progress: bool) -> None:
+        """Publish the startup gate state to durable adapter preflights."""
+        if in_progress:
+            self._startup_restore_release_event = asyncio.Event()
+            self._startup_restore_in_progress = True
+            return
+        self._startup_restore_in_progress = False
+        release = getattr(self, "_startup_restore_release_event", None)
+        if release is not None:
+            release.set()
+
+    async def _wait_for_startup_restore_release(self) -> None:
+        """Wait without polling while startup owns normal inbound dispatch."""
+        while getattr(self, "_startup_restore_in_progress", False):
+            release = getattr(self, "_startup_restore_release_event", None)
+            if release is None or release.is_set():
+                release = asyncio.Event()
+                self._startup_restore_release_event = release
+            await release.wait()
+
     async def _dispatch_startup_restore_event(self, adapter, event: MessageEvent) -> None:
         """Own a durable replay's wait without blocking other startup sessions."""
         from gateway.platforms.base import ProcessingOutcome
@@ -12123,7 +12145,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         self._startup_restore_tasks = []
         drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
+        self._set_startup_restore_in_progress(False)
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -13181,7 +13203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # restart-interrupted sessions are not auto-resumed until all startup
         # wiring below completes.  Queue inbound messages until the resume
         # pass runs and every synthetic resume turn has finished.
-        self._startup_restore_in_progress = True
+        self._set_startup_restore_in_progress(True)
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
 
@@ -13246,6 +13268,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            adapter.set_command_preflight_handler(self._primary_command_preflight())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13443,7 +13466,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
             self._request_clean_exit(reason)
-            self._startup_restore_in_progress = False
+            self._set_startup_restore_in_progress(False)
             return True
         except Exception as e:
             logger.error("Secondary-profile adapter startup failed: %s", e, exc_info=True)
@@ -13482,7 +13505,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
                 self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
                 self._request_clean_exit(reason)
-                self._startup_restore_in_progress = False
+                self._set_startup_restore_in_progress(False)
                 return True
             if startup_nonretryable_errors:
                 # Mixed failure mode (NS-609): some platforms are fatally
@@ -14863,6 +14886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    adapter.set_command_preflight_handler(self._primary_command_preflight())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -15954,6 +15978,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        adapter.set_command_preflight_handler(
+            self._make_profile_command_preflight(profile_name)
+        )
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -16226,6 +16253,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reconnect is scoped to the profile's own config and secret mapping;
         # never rebuild a secondary adapter with the default profile's credentials.
 
+    async def _gateway_command_preflight(self, event: MessageEvent):
+        """Authorize an adapter-native slash command before handler side effects."""
+        await self._wait_for_startup_restore_release()
+        source = event.source
+        if getattr(source, "profile_route_rejected", False) is True:
+            return MessageDisposition.REJECTED
+        if not self._is_user_authorized_for_source(source):
+            return MessageDisposition.REJECTED
+
+        from hermes_cli.commands import resolve_command
+
+        command = event.get_command()
+        command_def = resolve_command(command) if command else None
+        if command_def is None:
+            return MessageDisposition.REJECTED
+        return self._check_slash_access(source, command_def.name)
+
+    def _make_profile_command_preflight(self, profile_name: str):
+        """Bind native-command preflight to a secondary profile's scope."""
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            profile_home = get_profile_dir(profile_name)
+        except Exception:
+            profile_home = None
+
+        async def _preflight(event):
+            if getattr(event, "source", None) is not None and not event.source.profile:
+                event.source.profile = profile_name
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._gateway_command_preflight(event)
+            return await self._gateway_command_preflight(event)
+
+        return _preflight
+
     def _make_profile_message_handler(self, profile_name: str):
         """Return a message handler that stamps source.profile then delegates.
 
@@ -16268,6 +16331,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         return _handler
+
+    def _make_default_profile_command_preflight(self):
+        """Scope primary native-command policy like the multiplexed handler."""
+        default_home = Path(get_hermes_home())
+
+        async def _preflight(event):
+            source = event.source
+            source._authorization_profile_home = default_home
+            if (
+                not getattr(source, "profile", None)
+                and getattr(source, "profile_route_rejected", False) is not True
+            ):
+                from gateway.profile_routing import ProfileRouteRejected
+
+                try:
+                    source.profile = self._profile_name_for_source(source)
+                except ProfileRouteRejected:
+                    source.profile_route_rejected = True
+            profile_home = (
+                self._resolve_profile_home_for_source(source)
+                if getattr(source, "profile", None)
+                else default_home
+            )
+            with _profile_runtime_scope(profile_home):
+                return await self._gateway_command_preflight(event)
+
+        return _preflight
 
     def _make_default_profile_message_handler(self):
         """Scope primary-adapter messages to their routed multiplex profile.
@@ -16316,6 +16406,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._handle_message(event)
 
         return _handler
+
+    def _primary_command_preflight(self):
+        """Return the correctly scoped native-command boundary for a primary adapter."""
+        if getattr(self.config, "multiplex_profiles", False):
+            return self._make_default_profile_command_preflight()
+        return self._gateway_command_preflight
 
     def _primary_message_handler(self):
         """Return the correctly scoped handler for a primary adapter."""
@@ -17743,23 +17839,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
-            # /status and /context are intentionally pre-gate so users
-            # always see session state.
-            if _cmd_def_inner and _cmd_def_inner.name == "status":
-                return await self._handle_status_command(event)
-            if _cmd_def_inner and _cmd_def_inner.name == "context":
-                return await self._handle_context_command(event)
-
-            # Slash command access control on the running-agent fast-path.
-            # Mirrors the cold-path gate further below so non-admin users
-            # can't bypass gating just because an agent happens to be busy.
-            # /status above is intentionally pre-gate so users always see
-            # session state. /help and /whoami fall under the always-allowed
-            # floor inside _check_slash_access.
+            # Slash-command authorization always precedes command handler work,
+            # including read-only commands that intentionally dispatch while a
+            # session is busy.
             if _evt_cmd and _cmd_def_inner is not None:
                 _denied = self._check_slash_access(source, _cmd_def_inner.name)
                 if _denied is not None:
                     return _denied
+
+            # /status and /context intentionally bypass the busy-policy gate so
+            # authorized users can always inspect session state.
+            if _cmd_def_inner and _cmd_def_inner.name == "status":
+                return await self._handle_status_command(event)
+            if _cmd_def_inner and _cmd_def_inner.name == "context":
+                return await self._handle_context_command(event)
 
             # Any recognized slash command: dispatch according to its
             # declared busy_policy (dispatch / interrupt_then_dispatch /

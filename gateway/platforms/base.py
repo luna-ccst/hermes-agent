@@ -3184,6 +3184,16 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._durable_waiters: Dict[str, set[asyncio.Event]] = {}
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[Union[bool, MessageDisposition]]]] = None
+        # Gateway-owned command authorization boundary for adapters that expose
+        # a deliberately narrow native command surface.  The adapter must call
+        # ``preflight_gateway_command`` before its normal message handler; the
+        # runner supplies the profile-scoped implementation.
+        self._command_preflight_handler: Optional[
+            Callable[
+                [MessageEvent],
+                Awaitable[Optional[Union[str, "EphemeralReply", MessageDisposition]]],
+            ]
+        ] = None
         # Owning profile for a multiplexed secondary adapter, installed by
         # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
         # keys must carry the profile namespace, but ``source.profile`` is only
@@ -3838,6 +3848,27 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[Union[bool, MessageDisposition]]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_command_preflight_handler(
+        self,
+        handler: Optional[
+            Callable[
+                [MessageEvent],
+                Awaitable[Optional[Union[str, "EphemeralReply", MessageDisposition]]],
+            ]
+        ],
+    ) -> None:
+        """Set the gateway-owned authorization boundary for native commands."""
+        self._command_preflight_handler = handler
+
+    async def preflight_gateway_command(
+        self, event: MessageEvent
+    ) -> Optional[Union[str, "EphemeralReply", MessageDisposition]]:
+        """Authorize one adapter-native command, failing closed if unwired."""
+        handler = getattr(self, "_command_preflight_handler", None)
+        if handler is None:
+            raise RuntimeError("Gateway command preflight handler is unavailable")
+        return await handler(event)
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
