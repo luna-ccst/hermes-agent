@@ -1845,9 +1845,15 @@ class GatewaySlashCommandsMixin:
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
+                    model_value = model_cfg.get("default")
+                    provider_value = model_cfg.get("provider")
+                    base_url_value = model_cfg.get("base_url")
+                    if model_value is not None:
+                        current_model = model_value
+                    if provider_value is not None:
+                        current_provider = provider_value
+                    if base_url_value is not None:
+                        current_base_url = base_url_value
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
