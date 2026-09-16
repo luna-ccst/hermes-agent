@@ -6,7 +6,8 @@ import pytest
 import pytest_asyncio
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageDisposition, MessageEvent, ProcessingOutcome, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageDisposition, MessageEvent, ProcessingOutcome
 from gateway.run import GatewayRunner, _dequeue_pending_event
 from gateway.session import SessionSource, build_session_key
 

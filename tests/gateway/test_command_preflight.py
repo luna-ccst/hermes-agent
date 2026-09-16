@@ -5,13 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, PlatformConfig
-from gateway.platforms.base import (
-    BasePlatformAdapter,
-    MessageDisposition,
-    MessageEvent,
-    Platform,
-    SessionSource,
-)
+from gateway.platforms.base import BasePlatformAdapter, Platform, SessionSource
+from gateway.platforms.event import MessageDisposition, MessageEvent
 from gateway.run import GatewayRunner
 from hermes_constants import get_hermes_home
 
@@ -160,3 +155,40 @@ async def test_busy_status_is_permission_checked_before_status_handler(monkeypat
 
     assert "⛔ /status is admin-only here" in result
     runner._handle_status_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_preflight_restores_home_config_and_secrets_across_profiles(tmp_path, monkeypatch):
+    from agent.secret_scope import get_secret, is_multiplex_active, set_multiplex_active
+    from hermes_cli.config import load_config_readonly
+
+    root = tmp_path / '.hermes'
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    homes = {}
+    for name in ('a', 'b'):
+        home = root / 'profiles' / name
+        home.mkdir(parents=True)
+        (home / '.env').write_text(f'SLACK_BOT_TOKEN=test-{name}\n')
+        (home / 'config.yaml').write_text(f'model:\n  default: model-{name}\n')
+        homes[name] = home
+
+    runner = _runner(allowed=['status'])
+    seen = []
+
+    def authorized(source):
+        seen.append((source.profile, Path(get_hermes_home()),
+                     load_config_readonly()['model']['default'], get_secret('SLACK_BOT_TOKEN')))
+        return True
+
+    runner._is_user_authorized_for_source = authorized
+    handlers = {name: runner._make_profile_command_preflight(name) for name in homes}
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        for name in ('a', 'b', 'a'):
+            assert await handlers[name](_event()) is None
+            assert Path(get_hermes_home()) == root
+    finally:
+        set_multiplex_active(previous)
+    assert seen == [(name, homes[name], f'model-{name}', f'test-{name}') for name in ('a', 'b', 'a')]

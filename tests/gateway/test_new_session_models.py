@@ -84,18 +84,12 @@ def test_legacy_existing_session_is_not_reseeded(tmp_path):
     assert resumed.model_override is None
 
 
-@pytest.mark.parametrize("reset_kind", ["force", "idle", "suspended"])
+@pytest.mark.parametrize("reset_kind", ["force", "suspended"])
 def test_automatic_and_forced_new_sessions_take_current_default(tmp_path, reset_kind):
-    from datetime import timedelta
-
     config = GatewayConfig(new_session_models={"default": "initial-model"})
     store = SessionStore(tmp_path / "sessions", config)
     entry = store.get_or_create_session(source())
-    if reset_kind == "idle":
-        config.default_reset_policy.mode = "idle"
-        config.default_reset_policy.idle_minutes = 1
-        entry.updated_at -= timedelta(minutes=2)
-    elif reset_kind == "suspended":
+    if reset_kind == "suspended":
         store.suspend_session(entry.session_key)
     config.new_session_models["default"] = "updated-model"
     reset = store.get_or_create_session(source(), force_new=reset_kind == "force")
@@ -143,11 +137,9 @@ def test_config_round_trip_and_nested_form():
 
 
 def test_new_field_does_not_shift_positional_config_arguments():
-    from gateway.config import SessionResetPolicy
-
-    policy = SessionResetPolicy(mode="idle", idle_minutes=15)
-    config = GatewayConfig({}, policy)
-    assert config.default_reset_policy is policy
+    triggers = ["/new"]
+    config = GatewayConfig({}, triggers)
+    assert config.reset_triggers is triggers
     assert config.new_session_models == {}
 
 

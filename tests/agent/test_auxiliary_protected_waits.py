@@ -6,11 +6,9 @@ import httpx
 import pytest
 
 from agent import auxiliary_client as aux
-from agent.context_compressor import ContextCompressor
 
 
-@pytest.mark.parametrize("cause", ["budget", "hard"])
-def test_real_retry_loop_observes_digest_cutoff(monkeypatch, cause):
+def test_real_retry_loop_observes_owner_cancellation(monkeypatch):
     clock = [0.0]
     attempts = []
 
@@ -31,27 +29,14 @@ def test_real_retry_loop_observes_digest_cutoff(monkeypatch, cause):
     monkeypatch.setattr(aux, "_get_task_extra_body", lambda task: {})
     monkeypatch.setattr(aux, "_acquire_sync_aux_semaphore", lambda task: None)
     monkeypatch.setattr(aux, "_transient_retry_count", lambda: 2)
-    compressor = object.__new__(ContextCompressor)
-    compressor._session_id = "retry-budget"
-    compressor._compression_remaining_seconds = lambda: 1.2 - clock[0] if cause == "budget" else 20.0
-    monkeypatch.setattr("agent.context_compressor._serialize_turns_for_digest", lambda *a: "x" * 150000)
-
-    with aux.aux_interrupt_protection(cancel_check=lambda: cause == "hard" and clock[0] >= 1.08):
-        if cause == "hard":
-            with pytest.raises(aux.AuxiliaryExplicitCancellation):
-                compressor._augment_summary_lean("main summary", [{"role": "user", "content": "verbatim requirement"}])
-        else:
-            result = compressor._augment_summary_lean("main summary", [{"role": "user", "content": "verbatim requirement"}])
-            assert "main summary" in result
-            assert "verbatim requirement" in result
-            assert "budget exhausted" in result
-            assert "session_search" in result
+    with aux.aux_interrupt_protection(cancel_check=lambda: clock[0] >= 1.08):
+        with pytest.raises(aux.AuxiliaryExplicitCancellation):
+            aux.call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
     assert clock[0] < 1.2, "retry backoff exhausted the host's commit reserve"
     assert len(attempts) == 2, "no provider retry or sibling may start after cutoff"
 
 
-@pytest.mark.parametrize("cause", ["budget", "hard"])
-def test_protected_semaphore_queue_observes_digest_cutoff(monkeypatch, cause):
+def test_protected_semaphore_queue_observes_owner_cancellation(monkeypatch):
     clock = [0.0]
     releases = []
 
@@ -67,17 +52,9 @@ def test_protected_semaphore_queue_observes_digest_cutoff(monkeypatch, cause):
     provider = MagicMock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="late"))]))
     monkeypatch.setattr(aux, "_acquire_sync_aux_semaphore", lambda task: BusySemaphore())
     monkeypatch.setattr(aux, "_call_llm_impl", provider)
-    compressor = object.__new__(ContextCompressor)
-    compressor._session_id = "queue-budget"
-    compressor._compression_remaining_seconds = lambda: 1.2 - clock[0] if cause == "budget" else 20.0
-    with aux.aux_interrupt_protection(cancel_check=lambda: cause == "hard" and clock[0] >= 1.08):
-        if cause == "hard":
-            with pytest.raises(aux.AuxiliaryExplicitCancellation):
-                compressor._augment_summary_lean("main summary", [{"role": "user", "content": "verbatim requirement"}])
-        else:
-            result = compressor._augment_summary_lean("main summary", [{"role": "user", "content": "verbatim requirement"}])
-            assert "main summary" in result and "verbatim requirement" in result
-            assert "budget exhausted" in result and "session_search" in result
+    with aux.aux_interrupt_protection(cancel_check=lambda: clock[0] >= 1.08):
+        with pytest.raises(aux.AuxiliaryExplicitCancellation):
+            aux.call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
     assert clock[0] < 1.2
     provider.assert_not_called()
     assert releases == [], "never release a permit this request did not acquire"

@@ -1,8 +1,9 @@
 """Real waiters and trusted gateway correlation; no commands executed."""
 import pytest
 from gateway.run import GatewayRunner
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from tools import approval, clarify_gateway as cg
+from tools.approval_gateway_wait import _ApprovalEntry
 
 
 @pytest.mark.asyncio
@@ -10,8 +11,8 @@ from tools import approval, clarify_gateway as cg
 async def test_bound_approval_never_resolves_replacement(text):
     runner = object.__new__(GatewayRunner)
     runner._session_key_for_source = lambda source: 'bound-test'
-    first = approval._ApprovalEntry({'command': 'not executed'})
-    second = approval._ApprovalEntry({'command': 'not executed either'})
+    first = _ApprovalEntry({'command': 'not executed'})
+    second = _ApprovalEntry({'command': 'not executed either'})
     event = MessageEvent(text=text, trusted_prompt_reply={
         'kind': 'approval', 'session_key': 'bound-test',
         'request_id': first.data['request_id'],
@@ -42,8 +43,8 @@ async def test_bound_clarify_does_not_resolve_replacement():
 
 @pytest.mark.parametrize('request_id', ['', 'stale'])
 def test_explicit_request_never_falls_back_to_fifo_or_all(request_id):
-    first = approval._ApprovalEntry({'command': 'A'})
-    second = approval._ApprovalEntry({'command': 'B'})
+    first = _ApprovalEntry({'command': 'A'})
+    second = _ApprovalEntry({'command': 'B'})
     with approval._lock:
         approval._gateway_queues['optional-id'] = [first, second]
     try:
@@ -89,7 +90,7 @@ def test_clarify_replacement_during_text_coercion_cannot_consume_new_prompt(monk
 
 
 def test_cancelled_approval_cannot_be_reapproved():
-    entry = approval._ApprovalEntry({'command': 'never executed'})
+    entry = _ApprovalEntry({'command': 'never executed'})
     entry.result = 'deny'
     entry.event.set()
     with approval._lock:
@@ -120,7 +121,7 @@ async def test_real_gateway_authorizes_bound_reply(monkeypatch, authorized, kind
     runner.adapters = {}
     runner._pending_approvals = {}
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='test', user_id='actor')
-    entry = approval._ApprovalEntry({'command': 'not executed'})
+    entry = _ApprovalEntry({'command': 'not executed'})
     question = cg.register('integration-question', 'integration-test', 'Question?', None)
     with approval._lock:
         approval._gateway_queues['integration-test'] = [entry]
@@ -136,4 +137,3 @@ async def test_real_gateway_authorizes_bound_reply(monkeypatch, authorized, kind
         cg.clear_session('integration-test')
         with approval._lock:
             approval._gateway_queues.pop('integration-test', None)
-
