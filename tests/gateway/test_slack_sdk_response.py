@@ -267,6 +267,23 @@ class TestHandoffThread:
         adapter._get_client = lambda *_a, **_kw: client
         thread_id = asyncio.run(adapter.create_handoff_thread("C_GEN", "review"))
         assert thread_id == "1700000000.000100"
+        client.chat_postMessage.assert_awaited_once_with(channel="C_GEN", text="review")
+
+    @response_shape
+    def test_seed_preserves_a_descriptive_title(self, make_response):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.chat_postMessage = AsyncMock(
+            return_value=make_response({"ok": True, "ts": "1700000000.000100"})
+        )
+        adapter._get_client = lambda *_a, **_kw: client
+        title = (
+            "Sales call: Sai w/ Skip Dawson from College Planning of Greater Long Beach — 11am ET"
+        )
+
+        asyncio.run(adapter.create_handoff_thread("C_GEN", title))
+
+        client.chat_postMessage.assert_awaited_once_with(channel="C_GEN", text=title)
 
     def test_unreadable_response_yields_no_thread(self):
         """Callers must still see a clean ``None`` for genuinely opaque replies."""

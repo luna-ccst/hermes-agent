@@ -2423,6 +2423,7 @@ class TestCronDeliveryMirror:
                 {"id": "j1", "name": "Brief"}, adapter, "123", loop=MagicMock(),
             )
         assert tid == "9001"
+        adapter.create_handoff_thread.assert_called_once_with("123", "Brief")
 
 
     def test_seed_thread_session_creates_session_and_mirrors(self):
